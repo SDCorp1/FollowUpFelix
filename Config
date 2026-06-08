@@ -1,0 +1,132 @@
+// ============================================================
+// config.js — Follow-Up Felix configuration
+//
+// This is the ONLY file you should need to edit.
+// All behaviour, timing, tone, and identity lives here.
+// ============================================================
+
+
+// ── Identity ────────────────────────────────────────────────
+// Your primary sending address is detected automatically.
+// Add any aliases or shared inboxes you send FROM here so
+// Felix knows to treat them as "you" rather than external.
+
+const INTERNAL_EMAILS_EXTRA = [
+  // "alias@yourdomain.com",
+  // "shared@yourdomain.com",
+];
+
+// Add your company domain(s). Any sender @these domains will
+// be treated as internal and never followed up.
+const INTERNAL_DOMAINS = [
+  // "yourdomain.com",
+];
+
+
+// ── Gmail labels ────────────────────────────────────────────
+// These must exist in Gmail before Felix runs.
+// Change names here if you prefer different label names —
+// just make sure the Gmail labels match exactly.
+
+const LABEL = {
+  WATCH:   "-Snoozed-AI-FollowUp",  // You apply this to trigger Felix
+  STAGE_1: "FollowedUp-1",          // Felix applies after F1
+  STAGE_2: "FollowedUp-2",          // Felix applies after F2 (final)
+};
+
+
+// ── Timing ──────────────────────────────────────────────────
+// How many hours to wait between F1 and F2.
+// Default: 96 hours (4 days).
+
+const HOURS_BETWEEN_FOLLOWUPS = 96;
+
+// How many recent messages to include as context for the AI.
+// Higher = more context, more tokens used.
+const CONTEXT_MESSAGE_COUNT = 5;
+
+
+// ── AI provider ─────────────────────────────────────────────
+// Choose which AI to use for generating follow-ups.
+//
+// Options:  "claude"    → Anthropic Claude  (add CLAUDE_API_KEY to Script Properties)
+//           "openai"    → OpenAI            (add OPENAI_API_KEY)
+//           "deepseek"  → DeepSeek          (add DEEPSEEK_API_KEY)
+//           "gemini"    → Google Gemini     (add GEMINI_API_KEY)
+//
+// Only set the API key for the provider you're using.
+// All keys go in: Apps Script → Project Settings → Script Properties
+
+const AI_PROVIDER = "claude";  // ← change this to switch provider
+
+// Model string for your chosen provider. Examples:
+//
+//   Claude:    "claude-sonnet-4-5"  "claude-haiku-4-5"  "claude-opus-4-5"
+//   OpenAI:    "gpt-4o"            "gpt-4o-mini"        "gpt-4-turbo"
+//   DeepSeek:  "deepseek-chat"     "deepseek-reasoner"
+//   Gemini:    "gemini-2.0-flash"  "gemini-1.5-pro"     "gemini-1.5-flash"
+
+const AI_MODEL = "claude-sonnet-4-5";  // ← match this to your provider
+
+// Max tokens for the AI response. 300 is plenty for short follow-ups.
+// Increase if you want longer, more detailed emails.
+const AI_MAX_TOKENS = 300;
+
+
+// ── Sign-off name ───────────────────────────────────────────
+// What Felix signs off as. Change to your own name or persona.
+
+const FELIX_NAME = "Follow-Up Felix";
+
+// Regex that matches your sign-off — used to detect Felix's
+// own messages in a thread and avoid self-reply loops.
+// Update this if you change FELIX_NAME above.
+const FELIX_SIG_REGEX = /Follow[-–—]Up Felix/;
+
+
+// ── Prompt customisation ────────────────────────────────────
+// Plain-English instructions for the AI per follow-up stage.
+// These work identically regardless of which provider you use.
+
+const PROMPT_F1 = `
+You are ${FELIX_NAME}, a helpful AI email assistant. Send a first follow-up message.
+
+Rules:
+- 2–4 sentences max
+- Friendly, warm, professional — not robotic
+- Use "we" not "I" when referring to prior communication
+- Ask if they had a chance to review, or gently ask for an update
+- Never say "just following up", "circling back", or "per my last email"
+- Never assume the recipient's role or decision-making power
+- Do not make decisions on the team's behalf
+- No excessive exclamation marks
+
+Sign off as "${FELIX_NAME}".
+`;
+
+const PROMPT_F2 = `
+You are ${FELIX_NAME}, a helpful AI email assistant. Send a brief final follow-up.
+
+Rules:
+- 1–2 sentences ONLY
+- Light, non-pushy — just a gentle last check-in
+- Use "we" not "I" when referring to prior communication
+- Do not apologise for following up
+- Do not assume any emotion or urgency
+
+Sign off as "${FELIX_NAME}".
+`;
+
+
+// ── Fallback messages ────────────────────────────────────────
+// Sent as-is if the AI API call fails entirely.
+
+const FALLBACK_F1 = `Just wanted to follow up on my previous message — let me know if you have any questions or need anything from us.\n\nCheers,\n${FELIX_NAME}`;
+const FALLBACK_F2 = `Just a quick final check-in. Feel free to reach out whenever the timing is right.\n\nCheers,\n${FELIX_NAME}`;
+
+
+// ── Debug ────────────────────────────────────────────────────
+// Set to true to enable verbose logging in Apps Script console.
+// Can also be toggled via Script Properties: FELIX_DEBUG = "true"
+
+const DEBUG_DEFAULT = false;
