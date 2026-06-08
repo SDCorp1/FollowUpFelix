@@ -1,0 +1,268 @@
+// ============================================================
+// ai.js — Multi-provider AI adapter
+//
+// Supports: Claude (Anthropic), OpenAI, DeepSeek, Gemini
+//
+// To add a new provider:
+//   1. Add its API key name to Script Properties
+//   2. Write an _call<Provider>() function following the pattern below
+//   3. Add a case for it in generateReply()
+//   4. Set AI_PROVIDER in config.js
+//
+// Depends on: config.js, utils.js
+// ============================================================
+
+
+// ── Prompt builder ───────────────────────────────────────────
+// Shared across all providers — the prompt format is the same
+// regardless of which AI generates the reply.
+
+/**
+ * Build the full prompt for a follow-up message.
+ *
+ * @param {string}  subject          - Thread subject line
+ * @param {string}  fullThreadText   - Recent messages as plain text
+ * @param {boolean} isSecondFollowup - True if sending F2
+ * @returns {string}
+ */
+function buildPrompt(subject, fullThreadText, isSecondFollowup) {
+  const instruction = isSecondFollowup ? PROMPT_F2 : PROMPT_F1;
+
+  return `
+${instruction.trim()}
+
+The subject of this conversation is:
+"${subject}"
+
+Here is the recent conversation context:
+${fullThreadText}
+
+Write the reply body ONLY — no subject line, no preamble, no markdown.
+End your message with:
+
+Cheers,
+${FELIX_NAME}
+`.trim();
+}
+
+
+// ── Main dispatch ────────────────────────────────────────────
+
+/**
+ * Generate a follow-up reply using whichever provider is set
+ * in AI_PROVIDER (config.js).
+ *
+ * Returns a fallback string if the API call fails for any reason.
+ *
+ * @param {string}  prompt           - Full prompt string
+ * @param {boolean} isSecondFollowup - Selects the right fallback
+ * @returns {string} Reply body text
+ */
+function generateReply(prompt, isSecondFollowup = false) {
+  const fallback = isSecondFollowup ? FALLBACK_F2 : FALLBACK_F1;
+  const promptSafe = String(prompt ?? "").trim();
+
+  if (!promptSafe) {
+    Logger.log("❌ Prompt is empty → using fallback");
+    return fallback;
+  }
+
+  const provider = (AI_PROVIDER || "").toLowerCase().trim();
+  Logger.log(`🤖 AI provider: ${provider}`);
+
+  try {
+    switch (provider) {
+      case "claude":    return _callClaude(promptSafe, fallback);
+      case "openai":    return _callOpenAI(promptSafe, fallback);
+      case "deepseek":  return _callDeepSeek(promptSafe, fallback);
+      case "gemini":    return _callGemini(promptSafe, fallback);
+      default:
+        Logger.log(`❌ Unknown AI_PROVIDER "${provider}". Valid options: claude, openai, deepseek, gemini`);
+        return fallback;
+    }
+  } catch (err) {
+    Logger.log("❌ Unhandled error in generateReply: " + err);
+    return fallback;
+  }
+}
+
+
+// ── Shared HTTP helper ───────────────────────────────────────
+
+/**
+ * Make a POST request and return the parsed JSON response body.
+ * Returns null on network error or non-2xx status.
+ *
+ * @param {string} url
+ * @param {object} headers
+ * @param {object} body
+ * @param {string} providerLabel - Used in log messages
+ * @returns {object|null}
+ */
+function _post(url, headers, body, providerLabel) {
+  let response, statusCode, rawBody;
+
+  try {
+    response = UrlFetchApp.fetch(url, {
+      method:             "post",
+      contentType:        "application/json",
+      headers:            headers,
+      payload:            JSON.stringify(body),
+      muteHttpExceptions: true,
+    });
+    statusCode = response.getResponseCode();
+    rawBody    = response.getContentText();
+  } catch (err) {
+    Logger.log(`❌ ${providerLabel} network error: ${err}`);
+    return null;
+  }
+
+  dlog(`🧠 ${providerLabel} HTTP status: ${statusCode}`);
+
+  if (statusCode >= 300) {
+    Logger.log(`❌ ${providerLabel} API error ${statusCode}: ${rawBody}`);
+    return null;
+  }
+
+  try {
+    return JSON.parse(rawBody);
+  } catch (err) {
+    Logger.log(`❌ ${providerLabel} JSON parse failed: ${err} | raw: ${rawBody}`);
+    return null;
+  }
+}
+
+
+// ── Provider: Anthropic Claude ───────────────────────────────
+// Docs: https://docs.anthropic.com/en/api/messages
+// Models: claude-opus-4-5, claude-sonnet-4-5, claude-haiku-4-5
+// Key property: CLAUDE_API_KEY
+
+function _callClaude(prompt, fallback) {
+  const apiKey = PropertiesService.getScriptProperties().getProperty("CLAUDE_API_KEY");
+  if (!apiKey) {
+    Logger.log("❌ CLAUDE_API_KEY not set in Script Properties");
+    return fallback;
+  }
+
+  const parsed = _post(
+    "https://api.anthropic.com/v1/messages",
+    {
+      "x-api-key":         apiKey,
+      "anthropic-version": "2023-06-01",
+    },
+    {
+      model:      AI_MODEL,
+      max_tokens: AI_MAX_TOKENS,
+      messages:   [{ role: "user", content: prompt }],
+    },
+    "Claude"
+  );
+
+  if (!parsed) return fallback;
+
+  const text = (parsed.content || [])
+    .filter(b => b && b.type === "text")
+    .map(b => b.text || "")
+    .join("")
+    .trim();
+
+  if (!text) { Logger.log("⚠️  Claude returned empty content"); return fallback; }
+  return text;
+}
+
+
+// ── Provider: OpenAI ─────────────────────────────────────────
+// Docs: https://platform.openai.com/docs/api-reference/chat
+// Models: gpt-4o, gpt-4o-mini, gpt-4-turbo, gpt-3.5-turbo
+// Key property: OPENAI_API_KEY
+
+function _callOpenAI(prompt, fallback) {
+  const apiKey = PropertiesService.getScriptProperties().getProperty("OPENAI_API_KEY");
+  if (!apiKey) {
+    Logger.log("❌ OPENAI_API_KEY not set in Script Properties");
+    return fallback;
+  }
+
+  const parsed = _post(
+    "https://api.openai.com/v1/chat/completions",
+    { "Authorization": "Bearer " + apiKey },
+    {
+      model:      AI_MODEL,
+      max_tokens: AI_MAX_TOKENS,
+      messages:   [{ role: "user", content: prompt }],
+    },
+    "OpenAI"
+  );
+
+  if (!parsed) return fallback;
+
+  const text = (parsed.choices?.[0]?.message?.content || "").trim();
+  if (!text) { Logger.log("⚠️  OpenAI returned empty content"); return fallback; }
+  return text;
+}
+
+
+// ── Provider: DeepSeek ───────────────────────────────────────
+// Docs: https://platform.deepseek.com/api-docs
+// Models: deepseek-chat, deepseek-reasoner
+// Key property: DEEPSEEK_API_KEY
+// Note: OpenAI-compatible API — same response shape as OpenAI
+
+function _callDeepSeek(prompt, fallback) {
+  const apiKey = PropertiesService.getScriptProperties().getProperty("DEEPSEEK_API_KEY");
+  if (!apiKey) {
+    Logger.log("❌ DEEPSEEK_API_KEY not set in Script Properties");
+    return fallback;
+  }
+
+  const parsed = _post(
+    "https://api.deepseek.com/chat/completions",
+    { "Authorization": "Bearer " + apiKey },
+    {
+      model:      AI_MODEL,
+      max_tokens: AI_MAX_TOKENS,
+      messages:   [{ role: "user", content: prompt }],
+    },
+    "DeepSeek"
+  );
+
+  if (!parsed) return fallback;
+
+  const text = (parsed.choices?.[0]?.message?.content || "").trim();
+  if (!text) { Logger.log("⚠️  DeepSeek returned empty content"); return fallback; }
+  return text;
+}
+
+
+// ── Provider: Google Gemini ──────────────────────────────────
+// Docs: https://ai.google.dev/api/generate-content
+// Models: gemini-2.0-flash, gemini-1.5-pro, gemini-1.5-flash
+// Key property: GEMINI_API_KEY
+// Note: Different request/response shape from the others
+
+function _callGemini(prompt, fallback) {
+  const apiKey = PropertiesService.getScriptProperties().getProperty("GEMINI_API_KEY");
+  if (!apiKey) {
+    Logger.log("❌ GEMINI_API_KEY not set in Script Properties");
+    return fallback;
+  }
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${AI_MODEL}:generateContent?key=${apiKey}`;
+
+  const parsed = _post(
+    url,
+    {},  // Gemini uses key param instead of auth header
+    {
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { maxOutputTokens: AI_MAX_TOKENS },
+    },
+    "Gemini"
+  );
+
+  if (!parsed) return fallback;
+
+  const text = (parsed.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
+  if (!text) { Logger.log("⚠️  Gemini returned empty content"); return fallback; }
+  return text;
+}
