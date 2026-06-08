@@ -1,0 +1,169 @@
+// ============================================================
+// felix.js — Main orchestration loop
+//
+// This is the entry point. Set your time-based trigger to run
+// main() on whatever schedule you prefer (every 2–4 hours works well).
+//
+// Depends on: config.js, utils.js, gmail.js, ai.js, recipients.js
+// ============================================================
+
+
+/**
+ * Main entry point.
+ *
+ * Pulls two thread pools:
+ *   Pool A — threads with the watch label that are back in inbox (snooze woke them)
+ *   Pool B — threads marked FollowedUp-1 but not yet FollowedUp-2 (F2 candidates)
+ *
+ * Deduplicates across pools so no thread is processed twice.
+ * For each thread, runs the decision logic and sends F1 or F2 if appropriate.
+ */
+function main() {
+  const labels = {
+    watch:  GmailApp.getUserLabelByName(LABEL.WATCH),
+    stage1: getOrCreateLabel(LABEL.STAGE_1),
+    stage2: getOrCreateLabel(LABEL.STAGE_2),
+  };
+
+  if (!labels.watch) {
+    Logger.log(`❌ Label "${LABEL.WATCH}" not found. Create it in Gmail first.`);
+    return;
+  }
+
+  const userEmail = getUserEmail();
+
+  // Build deduplicated thread list
+  const poolA = labels.watch.getThreads();
+  const poolB = GmailApp.search(`label:${LABEL.STAGE_1} -label:${LABEL.STAGE_2}`);
+
+  const seen    = new Set();
+  const threads = [];
+  [...poolA, ...poolB].forEach(t => {
+    if (!seen.has(t.getId())) { seen.add(t.getId()); threads.push(t); }
+  });
+
+  Logger.log(`📬 Threads to process: ${threads.length}`);
+
+  threads.forEach(thread => processThread(thread, labels, userEmail));
+}
+
+
+// ── Per-thread logic ─────────────────────────────────────────
+
+/**
+ * Evaluate and act on a single thread.
+ *
+ * Decision flow:
+ *   1. Find your last sent message index
+ *   2. Check if any external party replied after that
+ *      → Yes: clear labels and stop (Felix's job is done)
+ *   3. Confirm you are still the last sender
+ *   4. Determine stage (F1 or F2) and check any timing gates
+ *   5. Resolve recipient, build prompt, call Claude, send
+ *
+ * @param {GoogleAppsScript.Gmail.GmailThread} thread
+ * @param {object} labels - { watch, stage1, stage2 }
+ * @param {string} userEmail
+ */
+function processThread(thread, labels, userEmail) {
+  const subject  = thread.getFirstMessageSubject();
+  const messages = thread.getMessages();
+  const last     = messages[messages.length - 1];
+  const lastFrom = extractAddress(last.getFrom());
+
+  const threadLabels = thread.getLabels().map(l => l.getName());
+  const hasStage1    = threadLabels.includes(LABEL.STAGE_1);
+  const hasStage2    = threadLabels.includes(LABEL.STAGE_2);
+
+  dlog(`🧵 "${subject}" stage1=${hasStage1} stage2=${hasStage2} lastFrom=${lastFrom}`);
+
+  // ── 1. Find your last sent message ──────────────────────────
+  let lastUserIdx = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (extractAddress(messages[i].getFrom()) === userEmail) {
+      lastUserIdx = i;
+      break;
+    }
+  }
+
+  if (lastUserIdx < 0) {
+    skipLog(subject, "no outbound message found — skipping");
+    return;
+  }
+
+  // ── 2. Check for external reply after your last message ─────
+  const recipientReplied = messages.slice(lastUserIdx + 1).some(m => {
+    const from = extractAddress(m.getFrom());
+    return from !== userEmail && !isInternal(from);
+  });
+
+  dlog(`🔍 recipientReplied=${recipientReplied}`);
+
+  if (recipientReplied) {
+    skipLog(subject, "recipient replied — clearing Felix labels");
+    clearFelixLabels(thread, labels);
+    return;
+  }
+
+  // ── 3. Confirm you are the last sender ──────────────────────
+  if (lastFrom !== userEmail) {
+    skipLog(subject, `last sender is ${lastFrom}, not you — skipping`);
+    return;
+  }
+
+  // ── 4a. Already done both stages? ───────────────────────────
+  if (hasStage1 && hasStage2) {
+    skipLog(subject, "both follow-ups already sent — skipping");
+    return;
+  }
+
+  // ── 4b. F1: must be in inbox (snooze must have woken it) ────
+  if (!hasStage1 && !thread.isInInbox()) {
+    skipLog(subject, "F1 requires thread to be in inbox — skipping");
+    return;
+  }
+
+  // ── 4c. F2: timing gate ──────────────────────────────────────
+  if (hasStage1 && !hasStage2) {
+    const hours = hoursSinceF1(thread.getId(), messages, userEmail);
+    if (hours < HOURS_BETWEEN_FOLLOWUPS) {
+      skipLog(subject, `only ${Math.floor(hours)}h since F1 — waiting for ${HOURS_BETWEEN_FOLLOWUPS}h gap`);
+      return;
+    }
+  }
+
+  // ── 5. Resolve recipient ─────────────────────────────────────
+  const { to, cc } = getRecipients(messages);
+  if (!to) {
+    skipLog(subject, "no valid external recipient found — aborting");
+    return;
+  }
+
+  // ── 6. Build context and call Claude ─────────────────────────
+  const context = getRecentThreadContext(messages);
+  const name    = sanitizeFirstName(getNameForRecipient(messages, to), to);
+
+  dlog(`🔍 Greeting name resolved to: "${name || "(none — using Hi there)"}"`);
+
+  const prompt = buildPrompt(subject, context, hasStage1);
+  const reply  = generateReply(prompt, hasStage1);
+
+  // Strip any greeting Claude may have added (we control the greeting)
+  const cleanReply = reply
+    .replace(/^[\s]*(Hi [^,\n]+,)[\r\n]*/i, "")
+    .replace(/^(?:\r?\n)+/, "");
+
+  const greeting = name ? `Hi ${name},` : "Hi there,";
+  const fullBody = `${greeting}\n\n${cleanReply}`;
+
+  // ── 7. Send and update labels ────────────────────────────────
+  sendGmailApiReply(thread.getId(), to, cc, subject, fullBody);
+
+  if (!hasStage1) {
+    applyStage1(thread, labels);
+    Logger.log(`✅ F1 sent → ${to} | "${subject}"`);
+  } else {
+    applyStage2(thread, labels);
+    Logger.log(`✅ F2 sent → ${to} | "${subject}" — Felix is done with this thread`);
+  }
+}
