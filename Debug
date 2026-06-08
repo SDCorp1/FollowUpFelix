@@ -1,0 +1,240 @@
+// ============================================================
+// debug.js — Developer tooling
+//
+// Run any of these manually from the Apps Script editor.
+// None of these send emails or modify labels.
+// Depends on: config.js, utils.js, gmail.js, recipients.js
+// ============================================================
+
+
+// ── Thread ID helpers ────────────────────────────────────────
+
+/**
+ * Save a thread ID so you don't have to paste it into every debug function.
+ * Run this once, then call the debug functions with no arguments.
+ *
+ * @param {string} id - Hex thread ID (from logThreadsInWatchLabel or Gmail URL)
+ */
+function setDebugThreadId(id) {
+  if (!id || !/^[0-9a-fA-F]+$/.test(String(id))) {
+    throw new Error("Invalid thread id: " + id + " (expected hex string)");
+  }
+  PropertiesService.getUserProperties().setProperty("felix:DEBUG_THREAD_ID", String(id));
+  Logger.log("✅ Debug thread id saved: " + id);
+}
+
+/**
+ * Find a thread by subject snippet and save its ID automatically.
+ * Useful when you don't want to dig into the Gmail URL for the ID.
+ *
+ * @param {string} subjectSnippet - Partial subject to search for
+ */
+function setDebugBySubject(subjectSnippet) {
+  const q = String(subjectSnippet || "").replace(/"/g, '\\"');
+  if (!q) { Logger.log("Provide a subject snippet"); return; }
+
+  const threads = GmailApp.search(`subject:"${q}"`);
+  if (!threads.length) { Logger.log("No threads found for: " + q); return; }
+
+  const id = threads[0].getId();
+  setDebugThreadId(id);
+  Logger.log(`✅ Saved: ${id}  ("${threads[0].getFirstMessageSubject()}")`);
+}
+
+function _resolveDebugId(idOpt) {
+  const id = (idOpt && String(idOpt)) ||
+    PropertiesService.getUserProperties().getProperty("felix:DEBUG_THREAD_ID");
+  if (!id || !/^[0-9a-fA-F]+$/.test(id)) {
+    throw new Error("No debug thread id set. Run setDebugBySubject() or setDebugThreadId() first.");
+  }
+  return id;
+}
+
+
+// ── Dashboard ─────────────────────────────────────────────────
+
+/**
+ * Print a full status dashboard for a thread — dry run only, nothing is sent.
+ *
+ * Shows:
+ *   - Current labels and stage
+ *   - Whether a recipient reply was detected
+ *   - Resolved To/CC addresses
+ *   - Whether F1 and F2 would fire, with blockers if not
+ *
+ * @param {string} [idOpt] - Thread ID, or omit to use saved debug ID
+ */
+function debugFelix(idOpt) {
+  const id       = _resolveDebugId(idOpt);
+  const thread   = GmailApp.getThreadById(id);
+  const messages = thread.getMessages();
+  const userEmail = getUserEmail();
+
+  const labelNames = thread.getLabels().map(l => l.getName());
+  const hasStage1  = labelNames.includes(LABEL.STAGE_1);
+  const hasStage2  = labelNames.includes(LABEL.STAGE_2);
+  const hasWatch   = labelNames.includes(LABEL.WATCH);
+
+  let lastUserIdx = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (extractAddress(messages[i].getFrom()) === userEmail) { lastUserIdx = i; break; }
+  }
+
+  const recipientReplied = lastUserIdx >= 0 && messages.slice(lastUserIdx + 1).some(m => {
+    const from = extractAddress(m.getFrom());
+    return from !== userEmail && !isInternal(from);
+  });
+
+  const { to, cc } = getRecipients(messages);
+  const lastFrom   = extractAddress(messages[messages.length - 1].getFrom());
+
+  const f1h = hasStage1 ? hoursSinceF1(id, messages, userEmail) : null;
+
+  Logger.log("═══════════ Felix Debug Dashboard ═══════════");
+  Logger.log("Thread ID   : " + id);
+  Logger.log("Subject     : " + thread.getFirstMessageSubject());
+  Logger.log("Labels      : " + (labelNames.join(", ") || "(none)"));
+  Logger.log("In Inbox?   : " + thread.isInInbox());
+  Logger.log("Watch label?: " + hasWatch);
+  Logger.log("Stage       : " + (hasStage2 ? "DONE (F2 sent)" : hasStage1 ? "F2 pending" : "F1 pending"));
+  Logger.log("Last sender : " + lastFrom + (lastFrom === userEmail ? " ← you" : " ← external"));
+  Logger.log("Last user @ : msg index " + lastUserIdx);
+  Logger.log("Replied?    : " + recipientReplied);
+  Logger.log("Resolved To : " + (to || "(none)"));
+  Logger.log("Resolved CC : " + (cc.length ? cc.join(", ") : "(none)"));
+  if (f1h !== null) Logger.log(`Hours since F1: ${Math.floor(f1h)}h (gate: ${HOURS_BETWEEN_FOLLOWUPS}h)`);
+
+  // Dry-run decisions
+  const f1Blockers = [];
+  if (hasStage1 || hasStage2)  f1Blockers.push("already labeled FollowedUp-1 or -2");
+  if (!hasWatch)               f1Blockers.push(`missing label "${LABEL.WATCH}"`);
+  if (!thread.isInInbox())     f1Blockers.push("not in inbox (snooze hasn't woken it yet)");
+  if (lastFrom !== userEmail)  f1Blockers.push("you weren't the last sender");
+  if (recipientReplied)        f1Blockers.push("recipient already replied");
+  if (!to)                     f1Blockers.push("no valid external To address");
+
+  const f2Blockers = [];
+  if (!hasStage1)              f2Blockers.push("F1 not yet sent");
+  if (hasStage2)               f2Blockers.push("F2 already sent");
+  if (lastFrom !== userEmail)  f2Blockers.push("you weren't the last sender");
+  if (recipientReplied)        f2Blockers.push("recipient already replied");
+  if (!to)                     f2Blockers.push("no valid external To address");
+  if (f1h !== null && f1h < HOURS_BETWEEN_FOLLOWUPS)
+    f2Blockers.push(`only ${Math.floor(f1h)}h since F1 (need ${HOURS_BETWEEN_FOLLOWUPS}h)`);
+
+  Logger.log("─────────────── Dry-run ───────────────");
+  Logger.log("F1 would fire: " + (f1Blockers.length === 0 ? "YES ✅" : "NO — " + f1Blockers.join(" | ")));
+  Logger.log("F2 would fire: " + (f2Blockers.length === 0 ? "YES ✅" : "NO — " + f2Blockers.join(" | ")));
+  Logger.log("═══════════════════════════════════════");
+}
+
+
+// ── Message inspector ─────────────────────────────────────────
+
+/**
+ * List all messages in the thread oldest-first.
+ * Useful for finding the right index to investigate.
+ */
+function debugListMessages(idOpt) {
+  const id       = _resolveDebugId(idOpt);
+  const thread   = GmailApp.getThreadById(id);
+  const messages = thread.getMessages();
+
+  Logger.log(`─── Messages in "${thread.getFirstMessageSubject()}" (oldest→newest) ───`);
+  messages.forEach((m, i) => {
+    Logger.log(`${i}) ${m.getDate().toISOString()} | ${extractAddress(m.getFrom())}`);
+  });
+}
+
+/**
+ * Show what Felix sees as the "reply window" — the messages
+ * that exist after your last outbound message.
+ */
+function debugReplyWindow(idOpt) {
+  const id        = _resolveDebugId(idOpt);
+  const thread    = GmailApp.getThreadById(id);
+  const messages  = thread.getMessages();
+  const userEmail = getUserEmail();
+
+  let lastUserIdx = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (extractAddress(messages[i].getFrom()) === userEmail) { lastUserIdx = i; break; }
+  }
+
+  Logger.log("─── Reply Window ───");
+  Logger.log("Your last msg index: " + lastUserIdx);
+  Logger.log("Messages after that: " + (messages.length - (lastUserIdx + 1)));
+  messages.slice(lastUserIdx + 1).forEach((m, i) => {
+    Logger.log(`  +${i}) ${m.getDate().toISOString()} | ${extractAddress(m.getFrom())}`);
+  });
+}
+
+/**
+ * Debug the name extraction path for the resolved To address.
+ * Shows the raw and cleaned body tail and the regex match result.
+ */
+function debugNamePick(idOpt) {
+  const id       = _resolveDebugId(idOpt);
+  const thread   = GmailApp.getThreadById(id);
+  const messages = thread.getMessages();
+  const { to }   = getRecipients(messages);
+
+  Logger.log("─── Name Pick Debug ───");
+  Logger.log("Resolved To: " + to);
+
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const from = extractAddress(messages[i].getFrom()).toLowerCase();
+    if (from !== (to || "").toLowerCase()) continue;
+
+    const raw   = messages[i].getPlainBody() || "";
+    const clean = stripQuotedHistory(raw);
+    const tail  = clean.slice(-900);
+
+    Logger.log("── Raw body tail (last 40 lines) ──");
+    Logger.log(raw.split("\n").slice(-40).join("\n"));
+    Logger.log("── Cleaned tail (last 40 lines) ──");
+    Logger.log(clean.split("\n").slice(-40).join("\n"));
+
+    const sig = tail.match(
+      /(?:^|\n)(?:thank you|thanks(?: again)?|many thanks|best(?: wishes)?(?: regards)?|kind regards|warm regards|all the best|cheers|sincerely|regards|respectfully)[,]?\s*(?:\n| )([A-Z][A-Za-z''\-]{1,29})/i
+    );
+    Logger.log("Sign-off regex match: " + (sig ? sig[1] : "(none)"));
+
+    const resolved = getNameForRecipient(messages, to);
+    const safe     = sanitizeFirstName(resolved, to);
+    Logger.log(`getNameForRecipient → "${resolved}" → sanitized → "${safe}"`);
+    return;
+  }
+  Logger.log("No message from To address found in thread.");
+}
+
+
+// ── Label utilities ───────────────────────────────────────────
+
+/**
+ * List the first 10 threads currently in the watch label.
+ * Handy for finding thread IDs without opening the Gmail URL.
+ */
+function logThreadsInWatchLabel() {
+  const label = GmailApp.getUserLabelByName(LABEL.WATCH);
+  if (!label) { Logger.log(`Label "${LABEL.WATCH}" not found`); return; }
+
+  const threads = label.getThreads().slice(0, 10);
+  if (!threads.length) { Logger.log("No threads in watch label."); return; }
+
+  Logger.log(`─── Threads in "${LABEL.WATCH}" ───`);
+  threads.forEach(t => Logger.log(`${t.getFirstMessageSubject()} → ${t.getId()}`));
+}
+
+
+// ── AI provider test ─────────────────────────────────────────
+
+/**
+ * Quick smoke-test for whichever AI provider is set in config.js.
+ * Should log "OK" within a few seconds if the key and model are valid.
+ */
+function testAiProvider() {
+  Logger.log("Testing provider: " + AI_PROVIDER + " / model: " + AI_MODEL);
+  const reply = generateReply("Reply with exactly one word: OK");
+  Logger.log("AI provider test response: " + reply);
+}
