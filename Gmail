@@ -1,0 +1,175 @@
+// ============================================================
+// gmail.js — Gmail read/write operations
+//
+// All Gmail API interactions live here. Nothing else should
+// call GmailApp or Gmail.Users directly.
+// Depends on: config.js, utils.js
+// ============================================================
+
+
+// ── Thread context ───────────────────────────────────────────
+
+/**
+ * Return the last N messages from a thread formatted as plain text
+ * for use as Claude context.
+ *
+ * Each message body is trimmed to 1000 characters to keep token
+ * usage reasonable. Increase if your threads contain long quotes
+ * you want Claude to have access to.
+ *
+ * @param {GoogleAppsScript.Gmail.GmailMessage[]} messages
+ * @param {number} count - Number of recent messages to include
+ * @returns {string}
+ */
+function getRecentThreadContext(messages, count) {
+  const n = count || CONTEXT_MESSAGE_COUNT;
+  return messages
+    .slice(-n)
+    .map(msg => {
+      const from = msg.getFrom().replace(/<.*?>/, "").trim();
+      const date = msg.getDate();
+      let body = msg.getPlainBody().replace(/\s+/g, " ");
+      if (body.length > 1000) body = "…" + body.slice(-1000);
+      return `From: ${from}\nDate: ${date}\n\n${body}`;
+    })
+    .join("\n\n---\n\n");
+}
+
+
+// ── Label management ─────────────────────────────────────────
+
+/**
+ * Get or create a Gmail label by name.
+ * @param {string} name
+ * @returns {GoogleAppsScript.Gmail.GmailLabel}
+ */
+function getOrCreateLabel(name) {
+  return GmailApp.getUserLabelByName(name) || GmailApp.createLabel(name);
+}
+
+/**
+ * Safely remove a label from a thread without throwing if it fails.
+ * @param {GoogleAppsScript.Gmail.GmailThread} thread
+ * @param {GoogleAppsScript.Gmail.GmailLabel}  label
+ */
+function safeRemoveLabel(thread, label) {
+  try { if (label) thread.removeLabel(label); } catch (e) {
+    dlog("⚠️  Could not remove label: " + e);
+  }
+}
+
+/**
+ * Clear all Felix-managed labels from a thread and delete stored properties.
+ * Called when a recipient replies (Felix's job is done).
+ *
+ * @param {GoogleAppsScript.Gmail.GmailThread} thread
+ * @param {object} labels - { watch, stage1, stage2 }
+ */
+function clearFelixLabels(thread, labels) {
+  safeRemoveLabel(thread, labels.watch);
+  safeRemoveLabel(thread, labels.stage1);
+  safeRemoveLabel(thread, labels.stage2);
+  _clearStamps(thread.getId());
+}
+
+/**
+ * Apply F1 label and record the send timestamp.
+ */
+function applyStage1(thread, labels) {
+  thread.addLabel(labels.stage1);
+  PropertiesService.getUserProperties()
+    .setProperty("felix:f1sent:" + thread.getId(), String(Date.now()));
+}
+
+/**
+ * Apply F2 label and clean up F1 label, watch label, and stamps.
+ */
+function applyStage2(thread, labels) {
+  thread.addLabel(labels.stage2);
+  safeRemoveLabel(thread, labels.stage1);
+  safeRemoveLabel(thread, labels.watch);
+  _clearStamps(thread.getId());
+}
+
+function _clearStamps(threadId) {
+  try {
+    const store = PropertiesService.getUserProperties();
+    store.deleteProperty("felix:f1sent:" + threadId);
+    store.deleteProperty("felix:wokeAt:" + threadId);
+  } catch (e) {}
+}
+
+
+// ── Timing ───────────────────────────────────────────────────
+
+/**
+ * Return the number of hours since F1 was sent for this thread.
+ * Returns Infinity if no F1 timestamp can be found (forces F2 to send).
+ *
+ * Uses stored timestamp first (reliable), then falls back to scanning
+ * the thread for Felix's signature (handles threads from before
+ * timestamps were introduced, or after a Properties purge).
+ *
+ * @param {string} threadId
+ * @param {GoogleAppsScript.Gmail.GmailMessage[]} messages
+ * @param {string} userEmail
+ * @returns {number} Hours since F1
+ */
+function hoursSinceF1(threadId, messages, userEmail) {
+  const stamp = PropertiesService.getUserProperties().getProperty("felix:f1sent:" + threadId);
+  if (stamp) {
+    return (Date.now() - Number(stamp)) / 3600000;
+  }
+
+  // Fallback: find Felix's last outbound message by signature
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m    = messages[i];
+    const from = extractAddress(m.getFrom());
+    if (from === userEmail && FELIX_SIG_REGEX.test(m.getBody())) {
+      return (Date.now() - m.getDate().getTime()) / 3600000;
+    }
+  }
+
+  return Infinity; // No F1 found → allow F2
+}
+
+
+// ── Sending ──────────────────────────────────────────────────
+
+/**
+ * Send a reply that is properly threaded to the last message
+ * in the thread using the Gmail API (In-Reply-To / References headers).
+ *
+ * Requires the Gmail Advanced Service to be enabled in your project.
+ *
+ * @param {string}   threadId
+ * @param {string}   to       - Recipient email address
+ * @param {string[]} cc       - CC addresses (may be empty)
+ * @param {string}   subject  - Thread subject (Re: is prepended automatically)
+ * @param {string}   body     - Plain-text email body
+ */
+function sendGmailApiReply(threadId, to, cc, subject, body) {
+  const thread = GmailApp.getThreadById(threadId);
+  const msgs   = thread.getMessages();
+  const last   = msgs[msgs.length - 1];
+  const msgId  = last.getHeader("Message-ID");
+
+  const ccHeader = (cc && cc.length) ? `Cc: ${cc.join(", ")}\r\n` : "";
+
+  const raw = Utilities.base64EncodeWebSafe(
+    `To: ${to}\r\n` +
+    ccHeader +
+    `Subject: Re: ${subject}\r\n` +
+    `In-Reply-To: ${msgId}\r\n` +
+    `References: ${msgId}\r\n` +
+    `Content-Type: text/plain; charset="UTF-8"\r\n\r\n` +
+    body
+  );
+
+  try {
+    Gmail.Users.Messages.send({ raw, threadId }, "me");
+    dlog(`📤 Sent reply to ${to} on thread "${subject}"`);
+  } catch (err) {
+    Logger.log("❌ Gmail send error: " + err);
+  }
+}
