@@ -1,0 +1,207 @@
+// ============================================================
+// recipients.js — Recipient resolution and name extraction
+//
+// Figures out who to send to, who to CC, and what to call them.
+// Depends on: utils.js, config.js
+// ============================================================
+
+
+// ── Identity helpers ─────────────────────────────────────────
+
+const _userEmail = Session.getEffectiveUser().getEmail().toLowerCase();
+
+const _internalEmails = new Set([
+  _userEmail,
+  ...(INTERNAL_EMAILS_EXTRA || []).map(e => e.toLowerCase()),
+]);
+
+const _internalDomains = new Set(
+  (INTERNAL_DOMAINS || []).map(d => d.toLowerCase())
+);
+
+/**
+ * Returns true if the email address belongs to you or your organisation.
+ */
+function isInternal(email) {
+  if (!email || !email.includes("@")) return false;
+  const [, domain] = email.split("@");
+  return _internalEmails.has(email) || _internalDomains.has(domain);
+}
+
+/**
+ * The current user's email address.
+ */
+function getUserEmail() {
+  return _userEmail;
+}
+
+
+// ── Recipient resolution ─────────────────────────────────────
+
+/**
+ * Determine the To and CC addresses for a follow-up reply.
+ *
+ * Strategy:
+ *   1. Most recent external sender → To  (they replied last, so they're engaged)
+ *   2. If nobody replied yet → first external address from original To/Cc → To
+ *   3. All other external addresses found anywhere in thread → Cc
+ *
+ * @param {GoogleAppsScript.Gmail.GmailMessage[]} messages
+ * @returns {{ to: string, cc: string[], bcc: string[] }}
+ */
+function getRecipients(messages) {
+  dlog(`🔍 Scanning ${messages.length} messages for external recipient`);
+
+  let toEmail = "";
+  const ccSet = new Set();
+
+  // 1) Most recent external sender
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const candidate = extractAddress(messages[i].getFrom());
+    if (!isInternal(candidate)) {
+      toEmail = candidate;
+      break;
+    }
+  }
+
+  // 2) Fallback: first external in original To/Cc
+  if (!toEmail) {
+    const first = messages[0];
+    const allAddrs = ((first.getTo() || "") + ";" + (first.getCc() || ""))
+      .split(/[;,]/)
+      .map(s => extractAddress(s.trim()))
+      .filter(e => e && !isInternal(e));
+
+    if (allAddrs.length) {
+      toEmail = allAddrs.shift();
+      allAddrs.forEach(e => ccSet.add(e));
+    }
+  }
+
+  // 3) CC all other external participants
+  messages.forEach(msg => {
+    ((msg.getTo() || "") + ";" + (msg.getCc() || ""))
+      .split(/[;,]/)
+      .map(s => extractAddress(s.trim()))
+      .filter(e => e && !isInternal(e) && e !== toEmail)
+      .forEach(e => ccSet.add(e));
+  });
+
+  dlog(`→ To: ${toEmail}`);
+  dlog(`→ CC: ${Array.from(ccSet).join(", ")}`);
+
+  return { to: toEmail, cc: Array.from(ccSet), bcc: [] };
+}
+
+
+// ── Name extraction ──────────────────────────────────────────
+
+/**
+ * Extract the best first name for a recipient from thread history.
+ *
+ * Tries in order:
+ *   1. Their sign-off in their most recent message  ("Thanks, Alex")
+ *   2. Our most recent greeting to them             ("Hi Alex,")
+ *   3. Their self-introduction                      ("I'm Alex")
+ *   4. Their display name from the From header      ("Alex Smith <...>")
+ *   5. Original To/Cc header display name           (cold outreach)
+ *   6. Email local-part                             ("alex.smith@..." → "Alex")
+ *
+ * Each candidate is passed through sanitizeFirstName() before returning.
+ *
+ * @param {GoogleAppsScript.Gmail.GmailMessage[]} messages
+ * @param {string} toEmail - The resolved recipient address
+ * @returns {string} First name, or "" if none found
+ */
+function getNameForRecipient(messages, toEmail) {
+  const to = (toEmail || "").toLowerCase();
+  if (!to) return "";
+
+  // 1) Sign-off in their most recent message
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg  = messages[i];
+    const from = extractAddress(msg.getFrom()).toLowerCase();
+    if (from !== to) continue;
+
+    const clean = stripQuotedHistory(msg.getPlainBody() || "");
+    const tail  = clean.slice(-900);
+
+    const sig = tail.match(
+      /(?:^|\n)(?:thank you|thanks(?: again)?|many thanks|best(?: wishes)?(?: regards)?|kind regards|warm regards|all the best|cheers|sincerely|regards|respectfully)[,]?\s*(?:\n| )([A-Z][A-Za-z''\-]{1,29})(?:\s+[A-Z][A-Za-z''\-]{1,29})?(?:\s*\n|$)/i
+    );
+    if (sig) {
+      const safe = sanitizeFirstName(sig[1], toEmail);
+      if (safe) return safe;
+    }
+  }
+
+  // 2) Our most recent greeting to this recipient
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg  = messages[i];
+    const from = extractAddress(msg.getFrom()).toLowerCase();
+    if (from !== _userEmail) continue;
+
+    const rcpts = ((msg.getTo() || "") + ";" + (msg.getCc() || "")).toLowerCase();
+    if (!rcpts.includes(to)) continue;
+
+    const head  = (msg.getPlainBody() || "").replace(/\r/g, "").trim().slice(0, 250);
+    const greet = head.match(/^(?:hi|hello|hey)\s+([^\s,!.?:;]{2,30})\s*,/i);
+    if (greet) {
+      const safe = sanitizeFirstName(greet[1], toEmail);
+      if (safe) return safe;
+    }
+  }
+
+  // 3) Self-introduction in their message
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg  = messages[i];
+    const from = extractAddress(msg.getFrom()).toLowerCase();
+    if (from !== to) continue;
+
+    const clean = stripQuotedHistory(msg.getPlainBody() || "");
+    const intro = clean.slice(0, 600).match(
+      /\b(?:i[' ]?m|i am|this is|my name is|it's)\s+([A-Z][A-Za-z''\-]{1,29})(?:\s+[A-Z][A-Za-z''\-]{1,29})?\b/
+    );
+    if (intro) {
+      const safe = sanitizeFirstName(intro[1], toEmail);
+      if (safe) return safe;
+    }
+  }
+
+  // 4) Display name from their From header
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg  = messages[i];
+    const from = extractAddress(msg.getFrom()).toLowerCase();
+    if (from !== to) continue;
+
+    const hdr = String(msg.getFrom()).match(/^([^<@]+)\s*</);
+    if (hdr) {
+      const cand = hdr[1].trim().split(/\s+/)[0];
+      const safe = sanitizeFirstName(cand, toEmail);
+      if (safe) return safe;
+    }
+  }
+
+  // 5) Original To/Cc header display name
+  const first = messages[0];
+  const headerBlock = ((first.getTo() || "") + ";" + (first.getCc() || ""));
+  for (const piece of headerBlock.split(/[;,]/).map(s => s.trim()).filter(Boolean)) {
+    const addr = extractAddress(piece).toLowerCase();
+    if (addr !== to) continue;
+
+    const m = piece.match(/^([^<@]+)\s*</);
+    if (m) {
+      const cand = m[1].trim().split(/\s+/)[0];
+      const safe = sanitizeFirstName(cand, toEmail);
+      if (safe) return safe;
+    }
+    break;
+  }
+
+  // 6) Email local-part
+  const local = to.split("@")[0].split(/[\._-]/)[0];
+  return sanitizeFirstName(
+    local ? local.charAt(0).toUpperCase() + local.slice(1) : "",
+    toEmail
+  ) || "";
+}
