@@ -1,0 +1,125 @@
+// ============================================================
+// utils.js — String helpers, sanitizers, and text processing
+//
+// Pure utility functions with no Gmail or API dependencies.
+// Safe to unit-test independently.
+// ============================================================
+
+
+// ── Logging ──────────────────────────────────────────────────
+
+const SCRIPT_PROPS = PropertiesService.getScriptProperties();
+const IS_DEBUG = DEBUG_DEFAULT || (SCRIPT_PROPS.getProperty('FELIX_DEBUG') === 'true');
+
+function dlog(msg) {
+  if (IS_DEBUG) Logger.log(msg);
+}
+
+function skipLog(subject, reason) {
+  Logger.log(`↩️  SKIP "${subject}": ${reason}`);
+}
+
+
+// ── Email address extraction ─────────────────────────────────
+
+/**
+ * Extract a clean lowercase email address from strings like
+ * "Jane Doe <jane@example.com>" or plain "jane@example.com".
+ * Returns empty string on bad input.
+ */
+function extractAddress(str) {
+  if (typeof str !== "string") return "";
+  const m = str.match(/<([^>]+)>/);
+  return (m ? m[1] : str).trim().toLowerCase();
+}
+
+
+// ── First name sanitizer ─────────────────────────────────────
+
+/**
+ * Validate and title-case a candidate first name.
+ *
+ * Rejects:
+ *   - Generic placeholders ("Name", "Team", "There", etc.)
+ *   - Role-based email prefixes on the toEmail ("info@", "sales@", etc.)
+ *   - Strings that are too short, too long, contain digits, or are initials
+ *
+ * @param {string} candidate  - Raw name string to validate
+ * @param {string} toEmail    - Recipient email (used for role-prefix check)
+ * @returns {string} Sanitized name, or "" if rejected
+ */
+function sanitizeFirstName(candidate, toEmail) {
+  if (!candidate) return "";
+
+  // Strip leading/trailing non-letter characters
+  let n = String(candidate).trim().replace(/^[^A-Za-z]+|[^A-Za-z]+$/g, "");
+  if (!n) return "";
+
+  const lower = n.toLowerCase();
+
+  // Blocklist: words that appear in email copy but aren't names
+  const BLOCKLIST = new Set([
+    "name", "there", "team", "friend", "customer", "sir", "madam",
+    "user", "test", "dear", "on", "from", "sent", "via",
+    "regards", "thanks", "best", "hello", "hi",
+  ]);
+  if (BLOCKLIST.has(lower)) return "";
+
+  // Length and format guards
+  if (n.length < 2 || n.length > 30) return "";
+  if (/^[a-z]\.?$/.test(lower)) return "";  // single initial
+  if (/\d/.test(n)) return "";              // contains digit
+
+  // Don't personalise role-based addresses (info@, sales@, etc.)
+  const local = (toEmail || "").split("@")[0].toLowerCase();
+  const ROLE_PREFIXES = [
+    "info", "sales", "support", "hello", "contact", "admin", "team",
+    "marketing", "billing", "accounts", "noreply", "no-reply",
+    "notifications", "newsletter",
+  ];
+  if (ROLE_PREFIXES.some(p => local.startsWith(p))) return "";
+
+  return n.charAt(0).toUpperCase() + n.slice(1);
+}
+
+
+// ── Quoted history stripper ──────────────────────────────────
+
+/**
+ * Remove quoted reply history from an email body.
+ *
+ * Strips:
+ *   - Lines beginning with ">"
+ *   - Everything after "On [date]... wrote:" (Gmail/iPhone style)
+ *   - "Begin forwarded message:" blocks
+ *   - "--- Original Message ---" blocks
+ *   - Outlook-style "From: ... Sent:" headers
+ *
+ * @param {string} body - Raw plain-text email body
+ * @returns {string} Body with quoted history removed
+ */
+function stripQuotedHistory(body) {
+  if (!body) return "";
+  let s = String(body).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+
+  // Remove quoted lines
+  s = s.replace(/^\s*>.*$/gm, "");
+
+  // Gmail / Apple Mail: "On [date], Name wrote:"
+  const rxOnWrote = /\nOn[\s\S]{0,800}?\bwrote:\s*\n?/i;
+  let i = s.search(rxOnWrote);
+  if (i >= 0) return s.slice(0, i).trim();
+
+  // Other common delimiters
+  const cuts = [
+    /^\s*Begin forwarded message:\s*$/im,
+    /-{2,}\s*Original Message\s*-{2,}/i,
+    /\nFrom:\s[\s\S]{0,400}?\nSent:\s/i,
+  ];
+  for (const rx of cuts) {
+    i = s.search(rx);
+    if (i >= 0) return s.slice(0, i).trim();
+  }
+
+  return s.trim();
+}
